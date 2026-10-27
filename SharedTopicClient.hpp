@@ -10,10 +10,12 @@ depends: []
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 
 #include "libxr_def.hpp"
 #include "message.hpp"
-#include "queue.hpp"
+#include "serialized_service.hpp"
+#include "slot_pool.hpp"
 #include "uart.hpp"
 
 /**
@@ -33,11 +35,6 @@ class SharedTopicClient
   struct PacketSlot
   {
     LibXR::RawData buffer;
-  };
-
-  struct ReadyPacket
-  {
-    uint32_t slot_index = 0;
     size_t packet_size = 0;
   };
 
@@ -73,9 +70,9 @@ class SharedTopicClient
   };
 
   /**
-   * @brief 构造 SharedTopicClient：创建槽位与队列，并为 topic_configs 中的每个 Topic
+   * @brief 构造 SharedTopicClient：创建槽池，并为 topic_configs 中的每个 Topic
    *        注册 callback。
-   *        Construct SharedTopicClient: create the slots and queues, and register a
+   *        Construct SharedTopicClient: create the slot pool, and register a
    *        callback on every Topic of topic_configs.
    *
    * @param uart 发送数据包的 UART，须有可写的 write port。
@@ -117,17 +114,23 @@ class SharedTopicClient
 
     ASSERT(max_packet_size <= uart_->write_port_->Capacity());
 
-    const size_t queue_capacity = LibXR::max(static_cast<size_t>(slot_count), size_t{2});
-    packets_ = new PacketSlot[slot_count];
-    free_slots_ = new LibXR::MPMCQueue<uint32_t>(queue_capacity);
-    ready_packets_ = new LibXR::MPMCQueue<ReadyPacket>(queue_capacity);
+    packets_ = new LibXR::SlotPool<PacketSlot>(slot_count);
     for (uint32_t i = 0; i < slot_count; i++)
     {
-      packets_[i].buffer = LibXR::RawData(new uint8_t[max_packet_size], max_packet_size);
-      ASSERT(free_slots_->Push(i) == LibXR::ErrorCode::OK);
+      size_t slot_index = 0;
+      [[maybe_unused]] const auto result = packets_->Acquire(slot_index);
+      ASSERT(result == LibXR::ErrorCode::OK);
+      new (std::addressof(packets_->At(slot_index)))
+          PacketSlot{LibXR::RawData(new uint8_t[max_packet_size], max_packet_size), 0};
+    }
+    // 初始化期间持有全部槽位，再统一归还，避免重复初始化同一个空槽。
+    // Hold every slot during initialization, then release them all exactly once.
+    for (uint32_t i = 0; i < slot_count; i++)
+    {
+      packets_->Release(i);
     }
 
-    tx_callback_ = LibXR::Callback<LibXR::ErrorCode>::CreateGuarded(
+    tx_callback_ = LibXR::Callback<LibXR::ErrorCode>::Create(
         [](bool in_isr, SharedTopicClient* self, LibXR::ErrorCode status)
         { self->OnWriteDone(in_isr, status); }, this);
     tx_op_ = LibXR::WriteOperation(tx_callback_);
@@ -157,65 +160,65 @@ class SharedTopicClient
                const LibXR::Topic::RawMessageView& message)
   {
     const size_t packet_size = message.payload.size_ + LibXR::Topic::PACK_BASE_SIZE;
-    uint32_t slot_index = 0;
+    size_t slot_index = 0;
 
-    if (free_slots_->Pop(slot_index) != LibXR::ErrorCode::OK)
+    if (packets_->Acquire(slot_index) != LibXR::ErrorCode::OK)
     {
       return;
     }
 
-    auto& slot = packets_[slot_index];
+    auto& slot = packets_->At(slot_index);
     ASSERT(packet_size <= slot.buffer.size_);
     if (LibXR::Topic(info.topic)
             .PackRaw(message.payload, slot.buffer, message.timestamp) !=
         LibXR::ErrorCode::OK)
     {
-      ReturnFreeSlot(slot_index);
+      packets_->Release(slot_index);
       return;
     }
 
-    if (ready_packets_->Push(ReadyPacket{slot_index, packet_size}) !=
-        LibXR::ErrorCode::OK)
-    {
-      ReturnFreeSlot(slot_index);
-      return;
-    }
+    slot.packet_size = packet_size;
+    packets_->Publish(slot_index);
     KickTx(in_isr);
   }
 
-  void KickTx(bool in_isr) { tx_callback_.Run(in_isr, LibXR::ErrorCode::OK); }
+  void KickTx(bool in_isr)
+  {
+    tx_service_.Invoke(1U, in_isr,
+                       [this](uint32_t, bool owner_in_isr) { TxService(owner_in_isr); });
+  }
 
   void TxService(bool in_isr)
   {
-    ReadyPacket packet;
-    if (ready_packets_->Pop(packet) != LibXR::ErrorCode::OK)
+    // 请求可以合并；每轮处理至多一个槽池容量，重入请求由串行服务继续处理。
+    // Requests may coalesce; drain at most one pool capacity per service pass.
+    for (size_t count = 0; count < packets_->Size(); ++count)
     {
-      return;
-    }
+      size_t slot_index = 0;
+      if (packets_->Take(slot_index) != LibXR::ErrorCode::OK)
+      {
+        return;
+      }
 
-    auto& slot = packets_[packet.slot_index];
-    uart_->Write(LibXR::ConstRawData{slot.buffer.addr_, packet.packet_size}, tx_op_,
-                 in_isr);
-    ReturnFreeSlot(packet.slot_index);
+      auto& slot = packets_->At(slot_index);
+      uart_->Write(LibXR::ConstRawData{slot.buffer.addr_, slot.packet_size}, tx_op_,
+                   in_isr);
+      // Write 在返回前完成数据复制；拒绝写入时也可立即归还本槽。
+      // Write copies admitted data before returning; rejected data can be released too.
+      packets_->Release(slot_index);
+    }
   }
 
   void OnWriteDone(bool in_isr, LibXR::ErrorCode)
   {
-    // 写入成功或失败，已提交的槽位都已归还，继续发送队列中的下一个包
-    // Whether the write succeeded or failed, its slot has been returned; continue with
-    // the next queued packet
-    TxService(in_isr);
-  }
-
-  void ReturnFreeSlot(uint32_t slot_index)
-  {
-    ASSERT(free_slots_->Push(slot_index) == LibXR::ErrorCode::OK);
+    // 写完成后请求重新检查待发槽；同步完成时由当前串行服务延后处理。
+    // Recheck ready slots after completion; inline callbacks defer to the active service.
+    KickTx(in_isr);
   }
 
   LibXR::UART* uart_;
-  PacketSlot* packets_ = nullptr;
-  LibXR::MPMCQueue<uint32_t>* free_slots_ = nullptr;
-  LibXR::MPMCQueue<ReadyPacket>* ready_packets_ = nullptr;
+  LibXR::SlotPool<PacketSlot>* packets_ = nullptr;
+  LibXR::SerializedService tx_service_;
   LibXR::Callback<LibXR::ErrorCode> tx_callback_;
   LibXR::WriteOperation tx_op_;
 };
